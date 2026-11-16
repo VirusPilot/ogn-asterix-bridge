@@ -26,7 +26,8 @@ referenced by `/etc/rtlsdr-ogn.conf`. If no decoder entry is found, it tries
 It reads latitude and longitude from readsb's `DECODER_OPTIONS` when both are
 set. Otherwise, it uses the OGN `Position` section. Installation stops if it
 cannot find a receiver callsign or a complete position. Rerun the installer after
-changing these settings.
+changing these settings. The service template's `--radius-km 50` requests
+OGN APRS reports within 50 km of that position.
 
 Check the bridge with:
 
