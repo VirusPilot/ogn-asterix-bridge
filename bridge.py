@@ -302,23 +302,32 @@ class RegistrationStore:
             }
         except (OSError, ValueError, TypeError):
             pass
+        LOG.info("Saved APRS registrations available: %d", len(self.entries))
         if self.ddb_path.exists():
             try:
                 cached_ddb = self.ddb_path.read_bytes()
                 self.ddb_entries = parse_ddb(cached_ddb)
                 self.ddb_types = parse_ddb_types(cached_ddb)
                 self.ddb_models = parse_ddb_models(cached_ddb, self.ddb_types)
+                LOG.info("Loaded cached OGN device database: %d address types, %d registrations, %d models",
+                         len(self.ddb_types), len(self.ddb_entries), len(self.ddb_models))
             except (OSError, UnicodeError, csv.Error) as exc:
                 LOG.warning("Cannot load cached OGN device database: %s", exc)
+        else:
+            LOG.info("No cached OGN device database; awaiting download")
         if self.tar1090_path.exists():
             try:
                 cached_tar1090 = self.tar1090_path.read_bytes()
-                validate_tar1090(cached_tar1090)
+                count = validate_tar1090(cached_tar1090)
                 self.tar1090_content = cached_tar1090
+                LOG.info("Loaded cached tar1090 aircraft database: %d records", count)
             except (OSError, EOFError, UnicodeError, ValueError, zlib.error) as exc:
                 LOG.warning("Cannot load cached tar1090 aircraft database: %s", exc)
+        else:
+            LOG.info("No cached tar1090 aircraft database; awaiting download")
         atomic_write(self.state_path, (json.dumps(self.entries, sort_keys=True) + "\n").encode())
         self.write_db()
+        LOG.info("Rebuilt merged readsb aircraft database: %s", self.db_path)
 
     def write_db(self):
         # readsb requires >1000 uncompressed bytes and at least one database row.
@@ -536,8 +545,11 @@ class Bridge:
     async def refresh_ddb(self):
         while True:
             try:
+                LOG.info("Checking OGN device database for updates")
                 content, entries, types, models = await asyncio.to_thread(download_ddb, self.args.ddb_url)
-                self.registrations.update_ddb(content, entries, types, models)
+                if not self.registrations.update_ddb(content, entries, types, models):
+                    LOG.info("OGN device database unchanged: %d address types, %d registrations, %d models",
+                             len(types), len(entries), len(models))
                 await asyncio.sleep(DATABASE_REFRESH)
             except (OSError, ValueError, UnicodeError, csv.Error) as exc:
                 LOG.warning("OGN device database download: %s", exc)
@@ -546,8 +558,10 @@ class Bridge:
     async def refresh_tar1090(self):
         while True:
             try:
+                LOG.info("Checking tar1090 aircraft database for updates")
                 content, count = await asyncio.to_thread(download_tar1090, self.args.tar1090_url)
-                self.registrations.update_tar1090(content, count)
+                if not self.registrations.update_tar1090(content, count):
+                    LOG.info("tar1090 aircraft database unchanged: %d records", count)
                 await asyncio.sleep(DATABASE_REFRESH)
             except (OSError, EOFError, ValueError, UnicodeError, zlib.error) as exc:
                 LOG.warning("tar1090 aircraft database download: %s", exc)

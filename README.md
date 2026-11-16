@@ -35,6 +35,10 @@ Check the bridge with:
 sudo journalctl -u ogn-asterix-bridge -f
 ```
 
+At startup, the log shows the cached database counts, the merged database
+rebuild, and the result of each online database check, including unchanged
+downloads. The same checks run daily.
+
 The bridge requires Python 3 and no third-party Python packages.
 The installer also connects readsb's raw Mode S output to loopback port 30992.
 The bridge uses those messages to identify aircraft received directly by
