@@ -22,9 +22,9 @@ sudo python3 "$BRIDGE_DIR/patch_tar1090.py"
 if ! grep -q '127.0.0.1,30991,asterix_in' "$READSB_CONFIG"; then
     sudo sed -i '/^NET_OPTIONS=/ s/"$/ --net-connector=127.0.0.1,30991,asterix_in"/' "$READSB_CONFIG"
 fi
-if ! grep -q -- '--db-file=/var/lib/ogn-asterix-bridge/aircraft.csv.gz' "$READSB_CONFIG"; then
-    sudo sed -i '/^DECODER_OPTIONS=/ s#"$# --db-file=/var/lib/ogn-asterix-bridge/aircraft.csv.gz"#' "$READSB_CONFIG"
-fi
+# Make the merged aircraft database readsb's only --db-file source.
+sudo sed -i '/^DECODER_OPTIONS=/ s# --db-file=[^ " ]*##g' "$READSB_CONFIG"
+sudo sed -i '/^DECODER_OPTIONS=/ s#"$# --db-file=/var/lib/ogn-asterix-bridge/aircraft.csv.gz"#' "$READSB_CONFIG"
 if ! grep -q -- '--db-file-lt' "$READSB_CONFIG"; then
     sudo sed -i '/^DECODER_OPTIONS=/ s/"$/ --db-file-lt"/' "$READSB_CONFIG"
 fi

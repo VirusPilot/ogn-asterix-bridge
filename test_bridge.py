@@ -4,7 +4,8 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from bridge import RegistrationStore, cat21, parse_ddb, parse_ddb_models, parse_ddb_types, parse_packet, parse_registration
+from bridge import (RegistrationStore, cat21, parse_ddb, parse_ddb_models,
+                    parse_ddb_types, parse_packet, parse_registration, validate_tar1090)
 from patch_tar1090 import NEW, OLD, patch_formatter, patch_index, patch_plane, patch_text
 
 
@@ -15,7 +16,7 @@ def sample(source="FLR123ABC", ident="id0A123ABC", tocall="OGFLR", table="/"):
 
 
 class BridgeTests(unittest.TestCase):
-    def test_ddb_fallback_and_aprs_precedence(self):
+    def test_ddb_registration_precedes_aprs(self):
         content = ("#DEVICE_TYPE,DEVICE_ID,AIRCRAFT_MODEL,REGISTRATION,CN,TRACKED,IDENTIFIED\n"
                    "'F','123ABC','Glider','D-ABCD','AB','Y','Y'\n"
                    "'O','234BCD','Glider','','CD','Y','Y'\n"
@@ -33,23 +34,59 @@ class BridgeTests(unittest.TestCase):
         self.assertEqual(models, {"123ABC": "Glider", "234BCD": "Glider",
                                   "456DEF": "Glider", "678901": "Piper Cub"})
         with tempfile.TemporaryDirectory() as directory:
-            store = RegistrationStore(Path(directory), None)
+            store = RegistrationStore(Path(directory))
             self.assertTrue(store.update_ddb(content, parse_ddb(content), types, models))
             self.assertFalse(store.update_ddb(content, parse_ddb(content), types, models))
             self.assertTrue(store.update("123ABC", "D-APRS"))
             payload = gzip.decompress(store.db_path.read_bytes()).decode()
-            self.assertIn("1123ABC;D-APRS;;00000000;Glider;;;", payload)
+            self.assertIn("1123ABC;D-ABCD;;00000000;Glider;;;", payload)
             self.assertIn("1234BCD;CD;;00000000;Glider;;;", payload)
             self.assertIn("456DEF;D-ADSB;;00000000;Glider;;;", payload)
             self.assertIn("1678901;D-CUB;;00000000;Piper Cub;;;", payload)
             self.assertNotIn("1345CDE;", payload)
             self.assertNotIn("1567EF0;", payload)
-            reloaded = RegistrationStore(Path(directory), None)
+            reloaded = RegistrationStore(Path(directory))
             self.assertEqual(reloaded.ddb_entries, parse_ddb(content))
             self.assertEqual(reloaded.ddb_types, types)
             self.assertEqual(reloaded.ddb_models, models)
-            self.assertIn("1123ABC;D-APRS;;00000000;Glider;;;",
+            self.assertIn("1123ABC;D-ABCD;;00000000;Glider;;;",
                           gzip.decompress(reloaded.db_path.read_bytes()).decode())
+
+    def test_tar1090_merge_preserves_base_and_uses_aprs_last(self):
+        tar_rows = ("123ABC;D-ICAO;G1;01;Base Model;Owner;Operator;2024\n"
+                    "456DEF;;;02;;;;\n"
+                    "789ABC;D-BASE;;00;;;;\n"
+                    "9ABCDE;D-KNOWN;;00;;;;\n")
+        tar_content = gzip.compress(tar_rows.encode(), mtime=0)
+        self.assertEqual(validate_tar1090(tar_content), 4)
+        ddb = ("#DEVICE_TYPE,DEVICE_ID,AIRCRAFT_MODEL,REGISTRATION,CN,TRACKED,IDENTIFIED\n"
+               "'F','123ABC','Flarm Model','D-FLARM','','Y','Y'\n"
+               "'I','456DEF','DDB Model','D-DDB','','Y','Y'\n"
+               "'I','789ABC','DDB Model','D-DDB2','','Y','Y'\n"
+               "'I','9ABCDE','','','','Y','Y'\n").encode()
+        with tempfile.TemporaryDirectory() as directory:
+            store = RegistrationStore(Path(directory))
+            store.update_ddb(ddb, parse_ddb(ddb), parse_ddb_types(ddb),
+                             parse_ddb_models(ddb, parse_ddb_types(ddb)))
+            self.assertTrue(store.update_tar1090(tar_content))
+            self.assertFalse(store.update_tar1090(tar_content))
+            database_before_aprs = store.db_path.read_bytes()
+            store.update("123ABC", "D-APRS1")
+            store.update("456DEF", "D-APRS2")
+            store.update("9ABCDE", "D-APRS3")
+            self.assertEqual(store.db_path.read_bytes(), database_before_aprs)
+            store.update("8C08E8", "D-APRS4")
+            payload = gzip.decompress(store.db_path.read_bytes()).decode()
+            self.assertIn("123ABC;D-ICAO;G1;01;Base Model;Owner;Operator;2024", payload)
+            self.assertIn("1123ABC;D-FLARM;;00000000;Flarm Model;;;", payload)
+            self.assertIn("456DEF;D-DDB;;02;DDB Model;;;", payload)
+            self.assertIn("789ABC;D-BASE;;00;DDB Model;;;", payload)
+            self.assertIn("9ABCDE;D-KNOWN;;00;;;;", payload)
+            self.assertIn("18C08E8;D-APRS4;;00000000;;;;", payload)
+            self.assertEqual(payload.count("456DEF;"), 1)
+            reloaded = RegistrationStore(Path(directory))
+            self.assertEqual(reloaded.tar1090_content, tar_content)
+            self.assertIn("18C08E8;D-APRS4", gzip.decompress(reloaded.db_path.read_bytes()).decode())
 
     def test_only_ddb_icao_type_uses_icao_address(self):
         packet = parse_packet(sample())
@@ -63,17 +100,19 @@ class BridgeTests(unittest.TestCase):
 
     def test_registration_status_and_readsb_database(self):
         now = datetime.datetime(2026, 11, 14, 11, 7, 13, tzinfo=datetime.timezone.utc).timestamp()
-        line = "APRS <- FLR8C08E8>OGFLR7,qOR:>110713h Reg=D-MXXY"
+        line = "FLR8C08E8>OGFLR7,qOR:>110713h Reg=D-MXXY"
         self.assertEqual(parse_registration(line, now), ("8C08E8", "D-MXXY"))
+        self.assertIsNone(parse_registration("APRS <- " + line, now))
         self.assertIsNone(parse_registration(line, now + 3600))
         self.assertIsNone(parse_registration(line.replace("FLR", "ICA", 1), now))
         with tempfile.TemporaryDirectory() as directory:
-            seed = Path(directory) / "seed.json"
-            seed.write_text('{"8C08E8":"D-MXXY"}')
-            store = RegistrationStore(Path(directory) / "state", seed)
+            store = RegistrationStore(Path(directory) / "state")
             payload = gzip.decompress(store.db_path.read_bytes()).decode()
             self.assertGreater(len(payload), 1000)
-            self.assertIn("18C08E8;D-MXXY;;00000000;;;;", payload)
+            self.assertNotIn("18C08E8;", payload)
+            self.assertTrue(store.update("8C08E8", "D-MXXY"))
+            self.assertIn("18C08E8;D-MXXY;;00000000;;;;",
+                          gzip.decompress(store.db_path.read_bytes()).decode())
             self.assertFalse(store.update("8C08E8", "D-MXXY"))
             self.assertTrue(store.update("8C08E8", "D-MXYZ"))
             self.assertIn("18C08E8;D-MXYZ", gzip.decompress(store.db_path.read_bytes()).decode())

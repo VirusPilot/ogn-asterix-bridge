@@ -99,35 +99,35 @@ colors.
 
 ## Registration
 
-The bridge reads `Reg=` from OGN APRS status reports, including the local
-decoder's `APRS <-` output on TCP port 50001. The APRS position feed does not
-reliably include these status reports, so the local decoder connection is
-needed for live updates. The current seed maps address `3FEC6F` to
-registration `D-MYGX`.
+The bridge reads `Reg=` only from status reports delivered by the subscribed
+OGN APRS feed. Its range filter may omit status reports; when that happens,
+registrations come from the aircraft databases instead.
 
-Registrations are saved in
-`/var/lib/ogn-asterix-bridge/registrations.json` and exported to readsb's
-`aircraft.csv.gz` in the same directory. The installer configures readsb to
-use this database. Readsb reloads it periodically, so a new registration can
-take about 30 seconds to appear in tar1090. Saved registrations expire after
-30 days without another status report.
+APRS registrations are saved in
+`/var/lib/ogn-asterix-bridge/registrations.json`. The bridge merges the
+[tar1090 aircraft database] with the [OGN Devices Database] into
+`/var/lib/ogn-asterix-bridge/aircraft.csv.gz`, which the installer sets as
+readsb's aircraft database. This retains the tar1090 registrations, ICAO types,
+flags, and other fields. Public OGN device records add registrations and models
+where the tar1090 record has no value. Readsb checks for database updates about
+every 30 seconds, so a change can take that long to appear in tar1090.
 
-On first startup, [registration-seeds.json](./registration-seeds.json) preloads
-this mapping. Once the saved registration state exists, changes to the seed
-file do not update that state. Future APRS status reports can update the
-registration.
+Saved APRS registrations expire after 30 days without another status report.
 
-When no APRS `Reg=` value has been received, the bridge looks up the six-digit
-device ID in the [OGN Devices Database]. It uses the database registration,
-or its `CN` callsign when registration is empty. Only publicly identified
-FLARM, ICAO, and OGN records are used for this fallback. APRS `Reg=` takes
-precedence. The bridge downloads the database at startup and daily thereafter,
-keeping a local `ddb.csv` copy for network outages.
+For each six-digit OGN device ID, a database registration takes precedence:
+the tar1090 record for an ICAO (`I`) address, then the public OGN device
+registration or its `CN` callsign. APRS `Reg=` is used only if neither database
+identifies the device. FLARM (`F`), OGN (`O`), and unknown addresses remain in
+readsb's non-ICAO address space so an unrelated ICAO record cannot supply their
+registration. Both source databases are downloaded at startup and daily
+thereafter; cached copies (`tar1090.csv.gz` and `ddb.csv`) are used during
+network outages.
 
 ## Aircraft type
 
-For publicly identified devices, the bridge exports `AIRCRAFT_MODEL` as
-readsb's long aircraft description (`desc`). The installer enables
+For publicly identified devices, the bridge uses OGN `AIRCRAFT_MODEL` as
+readsb's long aircraft description (`desc`) when the tar1090 record has no
+description. The installer enables
 `--db-file-lt` so readsb includes it in aircraft JSON. Tar1090 shows the model
 in the Type column and in the selected aircraft's type details. The database
 model is free text, so it is not written to readsb's four-character ICAO type
@@ -135,3 +135,4 @@ code field (`t`).
 
 [OGN APRS tocalls]: https://github.com/glidernet/ogn-aprs-protocol/blob/master/tocalls.txt
 [OGN Devices Database]: https://ddb.glidernet.org/download/
+[tar1090 aircraft database]: https://github.com/wiedehopf/tar1090-db/raw/csv/aircraft.csv.gz

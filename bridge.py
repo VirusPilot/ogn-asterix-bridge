@@ -16,6 +16,7 @@ import tempfile
 import time
 import unicodedata
 import urllib.request
+import zlib
 from pathlib import Path
 
 LOG = logging.getLogger("ogn-asterix")
@@ -37,8 +38,11 @@ REGISTRATION = re.compile(
 )
 REGISTRATION_LIFETIME = 30 * 86400
 DDB_URL = "https://ddb.glidernet.org/download/"
-DDB_REFRESH = 86400
+TAR1090_URL = "https://github.com/wiedehopf/tar1090-db/raw/csv/aircraft.csv.gz"
+DATABASE_REFRESH = 86400
 DDB_MAX_BYTES = 8 * 1024 * 1024
+TAR1090_MAX_BYTES = 32 * 1024 * 1024
+TAR1090_UNCOMPRESSED_MAX = 128 * 1024 * 1024
 
 
 def parse_packet(line, now=None):
@@ -86,10 +90,8 @@ def parse_packet(line, now=None):
 
 
 def parse_registration(line, now=None):
-    """Parse an OGN status packet such as APRS <- FLR8C08E8>...:>110713h Reg=D-MXXY."""
+    """Parse an OGN APRS status packet from the subscribed feed."""
     line = line.strip()
-    if "APRS <- " in line:
-        line = line.split("APRS <- ", 1)[1]
     match = REGISTRATION.match(line)
     if not match:
         return None
@@ -203,12 +205,45 @@ def download_ddb(url):
     return content, entries, types, models
 
 
+def tar1090_rows(content):
+    """Yield readsb's eight-column records from a bounded gzip archive."""
+    size = 0
+    with gzip.GzipFile(fileobj=io.BytesIO(content)) as database:
+        while raw := database.readline(4097):
+            size += len(raw)
+            if size > TAR1090_UNCOMPRESSED_MAX or len(raw) > 4096:
+                raise ValueError("tar1090 aircraft database exceeds size limit")
+            fields = raw.rstrip(b"\r\n").decode("utf-8").split(";")
+            if len(fields) != 8 or not re.fullmatch(r"[0-9A-Fa-f]{6,7}", fields[0]):
+                raise ValueError("invalid tar1090 aircraft database row")
+            yield fields
+
+
+def validate_tar1090(content, minimum=1):
+    count = sum(1 for _ in tar1090_rows(content))
+    if count < minimum:
+        raise ValueError("tar1090 aircraft database is unexpectedly small")
+    return count
+
+
+def download_tar1090(url):
+    request = urllib.request.Request(url, headers={"User-Agent": "ogn-asterix-bridge/1.0"})
+    with urllib.request.urlopen(request, timeout=60) as response:
+        content = response.read(TAR1090_MAX_BYTES + 1)
+    if len(content) > TAR1090_MAX_BYTES:
+        raise ValueError("tar1090 aircraft database exceeds size limit")
+    return content, validate_tar1090(content, minimum=100000)
+
+
 class RegistrationStore:
-    def __init__(self, directory, seed_path=None):
+    def __init__(self, directory):
         self.directory = Path(directory)
         self.state_path = self.directory / "registrations.json"
         self.db_path = self.directory / "aircraft.csv.gz"
         self.ddb_path = self.directory / "ddb.csv"
+        self.tar1090_path = self.directory / "tar1090.csv.gz"
+        self.tar1090_content = None
+        self.tar_registrations = {}
         self.ddb_entries = {}
         self.ddb_types = {}
         self.ddb_models = {}
@@ -233,33 +268,61 @@ class RegistrationStore:
                 self.ddb_models = parse_ddb_models(cached_ddb, self.ddb_types)
             except (OSError, UnicodeError, csv.Error) as exc:
                 LOG.warning("Cannot load cached OGN device database: %s", exc)
-        if seed_path and not self.state_path.exists():
+        if self.tar1090_path.exists():
             try:
-                seeds = json.loads(Path(seed_path).read_text())
-                for address, registration in seeds.items():
-                    if (re.fullmatch(r"[0-9A-F]{6}", address)
-                            and re.fullmatch(r"[A-Z0-9][A-Z0-9-]{1,11}", registration)
-                            and address not in self.entries):
-                        self.entries[address] = {"registration": registration, "updated": time.time()}
-            except (OSError, ValueError, TypeError) as exc:
-                LOG.warning("Cannot read registration seeds: %s", exc)
+                cached_tar1090 = self.tar1090_path.read_bytes()
+                validate_tar1090(cached_tar1090)
+                self.tar1090_content = cached_tar1090
+            except (OSError, EOFError, UnicodeError, ValueError, zlib.error) as exc:
+                LOG.warning("Cannot load cached tar1090 aircraft database: %s", exc)
         atomic_write(self.state_path, (json.dumps(self.entries, sort_keys=True) + "\n").encode())
         self.write_db()
 
     def write_db(self):
         # readsb requires >1000 uncompressed bytes and at least one database row.
         # 0x2000000 is outside readsb's ICAO and non-ICAO address ranges.
-        lines = ["#" + " " * 1024, "2000000;;;;;;;"]
-        combined = dict(self.ddb_entries)
-        combined.update({address: entry["registration"] for address, entry in self.entries.items()})
-        for address in sorted(combined.keys() | self.ddb_models.keys()):
-            db_address = address if self.ddb_types.get(address) == "I" else f"1{address}"
-            registration = combined.get(address, "")
+        additions = {}
+        identified = (self.ddb_entries.keys() | self.ddb_models.keys()) & self.ddb_types.keys()
+        for address in identified | self.entries.keys():
+            address_type = self.ddb_types.get(address)
+            db_address = address if address_type == "I" else f"1{address}"
+            ddb_registration = self.ddb_entries.get(address, "") if address_type else ""
+            aprs_registration = self.entries.get(address, {}).get("registration", "")
             model = self.ddb_models.get(address, "")
-            lines.append(f"{db_address};{registration};;00000000;{model};;;")
-        payload = ("\n".join(lines) + "\n").encode("ascii")
+            additions[db_address] = (ddb_registration, aprs_registration, model)
+
+        def merged_rows():
+            yield "#" + " " * 1024
+            yield "2000000;;;;;;;"
+            if self.tar1090_content is not None:
+                for fields in tar1090_rows(self.tar1090_content):
+                    if fields[1] and self.ddb_types.get(fields[0].upper()) == "I":
+                        tar_registrations[fields[0].upper()] = fields[1]
+                    extra = additions.pop(fields[0].upper(), None)
+                    if extra:
+                        fields[1] = fields[1] or extra[0] or extra[1]
+                        fields[4] = fields[4] or extra[2]
+                    yield ";".join(fields)
+            for address, (ddb_registration, aprs_registration, model) in sorted(additions.items()):
+                yield f"{address};{ddb_registration or aprs_registration};;00000000;{model};;;"
+
+        tar_registrations = {}
         old_mtime = int(self.db_path.stat().st_mtime) if self.db_path.exists() else 0
-        atomic_write(self.db_path, gzip.compress(payload, mtime=0))
+        self.db_path.parent.mkdir(parents=True, exist_ok=True)
+        with tempfile.NamedTemporaryFile(dir=self.db_path.parent, delete=False) as temp:
+            temporary = Path(temp.name)
+            try:
+                with gzip.GzipFile(fileobj=temp, mode="wb", compresslevel=5, mtime=0) as output:
+                    for row in merged_rows():
+                        output.write((row + "\n").encode("utf-8"))
+                temp.flush()
+                os.fsync(temp.fileno())
+                os.chmod(temp.name, 0o644)
+            except BaseException:
+                temporary.unlink(missing_ok=True)
+                raise
+        os.replace(temporary, self.db_path)
+        self.tar_registrations = tar_registrations
         # readsb checks whole-second mtime every 30 seconds.
         timestamp = max(int(time.time()), old_mtime + 1)
         os.utime(self.db_path, (timestamp, timestamp))
@@ -270,20 +333,46 @@ class RegistrationStore:
         atomic_write(self.state_path, (json.dumps(self.entries, sort_keys=True) + "\n").encode())
         if unchanged:
             return False
-        self.write_db()
+        # Database registrations take precedence; a new APRS value only affects
+        # the exported file when neither source identifies the aircraft.
+        database_registration = ((self.ddb_entries.get(address) if address in self.ddb_types else None)
+                                 or (self.tar_registrations.get(address)
+                                     if self.ddb_types.get(address) == "I" else None))
+        if not database_registration:
+            self.write_db()
         LOG.info("Registration %s: %s", address, registration)
         return True
 
     def update_ddb(self, content, entries, types, models):
         if entries == self.ddb_entries and types == self.ddb_types and models == self.ddb_models:
             return False
-        atomic_write(self.ddb_path, content)
+        previous = (self.ddb_entries, self.ddb_types, self.ddb_models)
         self.ddb_entries = entries
         self.ddb_types = types
         self.ddb_models = models
-        self.write_db()
+        try:
+            self.write_db()
+            atomic_write(self.ddb_path, content)
+        except BaseException:
+            self.ddb_entries, self.ddb_types, self.ddb_models = previous
+            raise
         LOG.info("Loaded %d OGN device address types, %d registrations, %d models",
                  len(types), len(entries), len(models))
+        return True
+
+    def update_tar1090(self, content, count=None):
+        if content == self.tar1090_content:
+            return False
+        count = validate_tar1090(content) if count is None else count
+        previous = self.tar1090_content
+        self.tar1090_content = content
+        try:
+            self.write_db()
+            atomic_write(self.tar1090_path, content)
+        except BaseException:
+            self.tar1090_content = previous
+            raise
+        LOG.info("Loaded %d tar1090 aircraft records", count)
         return True
 
 
@@ -319,7 +408,7 @@ class Bridge:
     def __init__(self, args):
         self.args = args
         self.clients = set()
-        self.registrations = RegistrationStore(args.registration_dir, args.registration_seeds)
+        self.registrations = RegistrationStore(args.registration_dir)
 
     def handle_registration(self, line):
         result = parse_registration(line)
@@ -373,42 +462,31 @@ class Bridge:
                         pass
             await asyncio.sleep(10)
 
-    async def monitor_decoder(self):
-        """Read the local decoder's APRS status output; the range feed omits it."""
-        while True:
-            writer = None
-            try:
-                reader, writer = await asyncio.open_connection("127.0.0.1", self.args.decoder_port)
-                LOG.info("Connected to local OGN decoder monitor")
-                while line := await reader.readline():
-                    if len(line) <= 4096:
-                        self.handle_registration(line.decode("ascii", "replace"))
-            except (OSError, ValueError) as exc:
-                LOG.warning("OGN decoder monitor: %s", exc)
-            finally:
-                if writer:
-                    writer.close()
-                    try:
-                        await writer.wait_closed()
-                    except OSError:
-                        pass
-            await asyncio.sleep(10)
-
     async def refresh_ddb(self):
         while True:
             try:
                 content, entries, types, models = await asyncio.to_thread(download_ddb, self.args.ddb_url)
                 self.registrations.update_ddb(content, entries, types, models)
-                await asyncio.sleep(DDB_REFRESH)
+                await asyncio.sleep(DATABASE_REFRESH)
             except (OSError, ValueError, UnicodeError, csv.Error) as exc:
                 LOG.warning("OGN device database download: %s", exc)
+                await asyncio.sleep(3600)
+
+    async def refresh_tar1090(self):
+        while True:
+            try:
+                content, count = await asyncio.to_thread(download_tar1090, self.args.tar1090_url)
+                self.registrations.update_tar1090(content, count)
+                await asyncio.sleep(DATABASE_REFRESH)
+            except (OSError, EOFError, ValueError, UnicodeError, zlib.error) as exc:
+                LOG.warning("tar1090 aircraft database download: %s", exc)
                 await asyncio.sleep(3600)
 
     async def run(self):
         server = await asyncio.start_server(self.client, "127.0.0.1", self.args.asterix_port)
         async with server:
             LOG.info("ASTERIX listening on 127.0.0.1:%d", self.args.asterix_port)
-            await asyncio.gather(self.aprs(), self.monitor_decoder(), self.refresh_ddb())
+            await asyncio.gather(self.aprs(), self.refresh_ddb(), self.refresh_tar1090())
 
 
 def main():
@@ -421,9 +499,8 @@ def main():
     parser.add_argument("--aprs-port", type=int, default=14580)
     parser.add_argument("--asterix-port", type=int, default=30991)
     parser.add_argument("--registration-dir", default="/var/lib/ogn-asterix-bridge")
-    parser.add_argument("--registration-seeds", default="/home/pi/ogn-asterix-bridge/registration-seeds.json")
-    parser.add_argument("--decoder-port", type=int, default=50001)
     parser.add_argument("--ddb-url", default=DDB_URL)
+    parser.add_argument("--tar1090-url", default=TAR1090_URL)
     args = parser.parse_args()
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     asyncio.run(Bridge(args).run())
