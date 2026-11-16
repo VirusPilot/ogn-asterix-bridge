@@ -1,7 +1,7 @@
 # OGN APRS to readsb ASTERIX bridge
 
 This bridge subscribes to `aprs.glidernet.org:14580` near the configured
-OGN receiver. It converts OGN aircraft position reports to ASTERIX CAT021 and
+OGN receiver station. It converts OGN aircraft position reports to ASTERIX CAT021 and
 serves the stream on loopback TCP port 30991. The installed `readsb` connects
 to that port, so tar1090 displays the aircraft through its normal readsb feed.
 
@@ -25,7 +25,7 @@ referenced by `/etc/rtlsdr-ogn.conf`. If no decoder entry is found, it tries
 
 It reads latitude and longitude from readsb's `DECODER_OPTIONS` when both are
 set. Otherwise, it uses the OGN `Position` section. Installation stops if it
-cannot find a callsign or a complete position. Rerun the installer after
+cannot find a receiver callsign or a complete position. Rerun the installer after
 changing these settings.
 
 Check the bridge with:
