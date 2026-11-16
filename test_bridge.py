@@ -4,8 +4,9 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from bridge import (RegistrationStore, cat21, parse_ddb, parse_ddb_models,
-                    parse_ddb_types, parse_packet, parse_registration, validate_tar1090)
+from bridge import (RegistrationStore, cat21, direct_icao, parse_ddb,
+                    parse_ddb_models, parse_ddb_types, parse_packet,
+                    parse_registration, source_status, validate_tar1090)
 from patch_tar1090 import NEW, OLD, patch_formatter, patch_index, patch_plane, patch_text
 
 
@@ -16,6 +17,21 @@ def sample(source="FLR123ABC", ident="id0A123ABC", tocall="OGFLR", table="/"):
 
 
 class BridgeTests(unittest.TestCase):
+    def test_direct_mode_s_addresses_and_source_expiry(self):
+        adsb = b"*8D3C66E158AF74F35E1C607CE4FF;\n"
+        mode_s = b"*A0281837FD09E32FE00FFF2F2E60;\n"
+        self.assertEqual(direct_icao(adsb), "3C66E1")
+        self.assertEqual(direct_icao(mode_s), "4122FC")
+        self.assertEqual(direct_icao(b"@000000000000" + adsb[1:]), "3C66E1")
+        self.assertIsNone(direct_icao(b"*0000;\n"))
+        self.assertIsNone(direct_icao(b"*invalid;\n"))
+        ogn = {"3C66E1": 100, "ABCDEF": 1}
+        direct = {"4122FC": 100, "ABCDEF": 1}
+        snapshot = source_status(ogn, direct, True, 110)
+        self.assertEqual(snapshot["ogn"], {"3C66E1": 1})
+        self.assertEqual(snapshot["direct"], {"4122FC": 1})
+        self.assertTrue(snapshot["raw_ready"])
+
     def test_ddb_registration_precedes_aprs(self):
         content = ("#DEVICE_TYPE,DEVICE_ID,AIRCRAFT_MODEL,REGISTRATION,CN,TRACKED,IDENTIFIED\n"
                    "'F','123ABC','Glider','D-ABCD','AB','Y','Y'\n"
@@ -134,11 +150,12 @@ class BridgeTests(unittest.TestCase):
                  "<script src=\"planeObject_abc123.js\"></script>"
                  "<script src=\"script_abc123.js\"></script>")
         index_updated = patch_index(index)
-        self.assertIn('script_abc123.js?ogn-ui=8', index_updated)
+        self.assertIn('script_abc123.js?ogn-ui=9', index_updated)
+        self.assertIn('ogn_sources.js?ogn-ui=9', index_updated)
         self.assertEqual(patch_index(index_updated), index_updated)
         plane = next(html.glob('planeObject_*.js')).read_text()
         plane_updated = patch_plane(plane)
-        self.assertEqual(plane_updated.count('this.icao.startsWith("~")'), 2)
+        self.assertEqual(plane_updated.count('window.ognBridgeIsOgn(this.icao,'), 2)
         self.assertIn('this.readsbDescription = `${data.desc}`;', plane_updated)
         self.assertEqual(patch_plane(plane_updated), plane_updated)
         formatter = next(html.glob('formatter_*.js')).read_text()

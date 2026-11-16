@@ -36,6 +36,9 @@ sudo journalctl -u ogn-asterix-bridge -f
 ```
 
 The bridge requires Python 3 and no third-party Python packages.
+The installer also connects readsb's raw Mode S output to loopback port 30992.
+The bridge uses those messages to identify aircraft received directly by
+readsb; raw messages are not injected back into readsb.
 
 ## Forwarded traffic
 
@@ -62,25 +65,27 @@ sudo python3 /home/pi/ogn-asterix-bridge/patch_tar1090.py
 
 ## Source label and color
 
-The bridge reads each address's device type from the [OGN Devices Database].
-Only `I` establishes a valid ICAO address and is sent without `~`, allowing
-readsb to match an aircraft received directly over ADS-B by hex code. `F`
-(FLARM), `O` (OGN), and addresses absent from the database are sent as
-non-ICAO; readsb shows these with a `~` prefix. This fallback avoids labelling
-an unlisted OGN target as ADS-B, even when its APRS source or `id` field
-suggests an ICAO address.
+The bridge uses the [OGN Devices Database] to determine whether a six-digit
+OGN device ID is a valid ICAO address. An `I` address is sent unchanged, so
+readsb can combine its OGN report with directly received Mode S or ADS-B from
+the same aircraft. `F` (FLARM), `O` (OGN), and unlisted addresses are sent as
+non-ICAO addresses, which readsb shows with a `~` prefix. This prevents an
+unrelated ICAO aircraft with the same six-digit code from being merged with
+the OGN target. Tar1090 determines the displayed source label separately.
 
-The tar1090 patch recognizes `~`-prefixed ASTERIX targets and displays `OGN`
-in its Source fields, table, legend, and source filter. An `I` target without
-`~` uses tar1090's normal ADS-B source label because readsb has no separate
-OGN source marker in its aircraft JSON. Direct ADS-B aircraft keep their ADS-B
-label.
+The tar1090 patch labels `~`-prefixed ASTERIX targets as `OGN`. For an `I`
+address, the bridge tracks recent OGN reports and readsb's directly received
+Mode S messages separately. Tar1090 labels that address `OGN` when it has a
+recent OGN report and no recent direct radio message. Directly received
+aircraft retain their normal source label. This provenance is served through
+`ogn-sources.json` in tar1090; if the raw output or status file is unavailable,
+ICAO targets retain tar1090's normal source label.
 
 When an `I` address is also received directly over ADS-B, readsb merges both
 inputs under the same hex code. It assigns injected ASTERIX data lower priority
 than direct ADS-B, so a recent ADS-B position normally wins even if an OGN
 report arrives later. OGN can still supply a field that direct reception has
-not supplied, such as geometric altitude. The ADS-B source label on the merged
+not supplied, such as geometric altitude. The direct source label on the merged
 tar1090 track does not mean that the OGN report was discarded.
 
 This also applies to a Mode S-only transponder with the same valid ICAO hex
@@ -91,8 +96,15 @@ track even though Mode S itself supplies no position. The OGN report must have
 a tocall other than `OGADSB`, and the OGN database must mark its address `I`
 so the bridge sends it without `~`.
 
-Selecting `OGN` in the source filter shows `~`-prefixed OGN tracks whether or
-not the optional AIS source is available. Those tracks use the former AIS
+While direct Mode S messages are recent, tar1090 labels this merged track
+`ADS-B` even if OGN supplies its position. Readsb reports the combined track
+as `adsb_icao`, and the source-label logic treats recent Mode S reception as
+direct traffic. If direct reception ages out while OGN reports continue, the
+label can change to `OGN`.
+
+Selecting `OGN` in the source filter shows both non-ICAO OGN tracks and
+ICAO OGN tracks without recent direct radio reception, whether or not the
+optional AIS source is available. Those tracks use the former AIS
 source color in the aircraft table, source legend, and source filter, including
 the selected-row shade. Map marker colors still follow tar1090's altitude
 colors.

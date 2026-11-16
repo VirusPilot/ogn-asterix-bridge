@@ -7,7 +7,9 @@ from pathlib import Path
 
 OLD = "format_altitude_long(adjust_baro_alt(selected.altitude), selected.vert_rate, DisplayUnits)"
 NEW = "format_altitude_long(adjust_baro_alt(selected.alt_baro), selected.vert_rate, DisplayUnits)"
-VERSION = "ogn-ui=8"
+VERSION = "ogn-ui=9"
+SOURCE_JS_TAG = f'<script src="ogn_sources.js?{VERSION}"></script>'
+SOURCE_STATUS_PATH = Path("/run/ogn-asterix-bridge/ogn-sources.json")
 
 
 def replace_once(text, old, new):
@@ -86,19 +88,27 @@ def patch_plane(text):
         '    }\n'
         '    if (data.t && data.t != this.icaoType) {',
     )
+    text = text.replace(
+        'this.dataSource = (this.icao.startsWith("~") && type == "adsb_icao") ? "ogn" : "adsb";',
+        'this.dataSource = window.ognBridgeIsOgn(this.icao, type) ? "ogn" : "adsb";',
+    )
     text = replace_once(
         text,
         '    } else if ((lat != null && type == null) || (type && (type.substring(0,4) == "adsb"))) {\n'
         '        this.dataSource = "adsb";',
         '    } else if ((lat != null && type == null) || (type && (type.substring(0,4) == "adsb"))) {\n'
-        '        this.dataSource = (this.icao.startsWith("~") && type == "adsb_icao") ? "ogn" : "adsb";',
+        '        this.dataSource = window.ognBridgeIsOgn(this.icao, type) ? "ogn" : "adsb";',
+    )
+    text = text.replace(
+        'this.dataSource = (this.icao.startsWith("~") && this.addrtype == "adsb_icao") ? "ogn" : "adsb";',
+        'this.dataSource = window.ognBridgeIsOgn(this.icao, this.addrtype) ? "ogn" : "adsb";',
     )
     text = replace_once(
         text,
         '    } else if (this.addrtype.substring(0,4) == "adsb") {\n'
         '        this.dataSource = "adsb";',
         '    } else if (this.addrtype.substring(0,4) == "adsb") {\n'
-        '        this.dataSource = (this.icao.startsWith("~") && this.addrtype == "adsb_icao") ? "ogn" : "adsb";',
+        '        this.dataSource = window.ognBridgeIsOgn(this.icao, this.addrtype) ? "ogn" : "adsb";',
     )
     text = replace_once(
         text,
@@ -121,12 +131,18 @@ def patch_index(text):
     updated, count = re.subn(pattern, lambda m: f"{m[1]}?{VERSION}{m[2]}", text)
     if count != 3:
         raise ValueError("Could not find tar1090's main script, plane object and formatter")
+    updated = re.sub(r'<script src="ogn_sources\.js[^\"]*"></script>\s*', "", updated)
+    anchor = re.search(r'<script src="planeObject_[^\"]+\.js\?[^\"]+"></script>', updated)
+    if not anchor:
+        raise ValueError("Could not find tar1090's plane object script")
+    updated = updated[:anchor.start()] + SOURCE_JS_TAG + "\n    " + updated[anchor.start():]
     return updated
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--html-dir", type=Path, default=Path("/usr/local/share/tar1090/html"))
+    parser.add_argument("--status-path", type=Path, default=SOURCE_STATUS_PATH)
     args = parser.parse_args()
     files = {}
     for name, patcher in (("script", patch_text), ("planeObject", patch_plane), ("formatter", patch_formatter)):
@@ -137,10 +153,21 @@ def main():
     index = args.html_dir / "index.html"
     files[index] = patch_index
     updates = {path: patcher(path.read_text()) for path, patcher in files.items()}
+    source_js = args.html_dir / "ogn_sources.js"
+    updates[source_js] = Path(__file__).with_name("ogn_sources.js").read_text()
+    status_link = args.html_dir / "ogn-sources.json"
+    if status_link.is_symlink():
+        if status_link.readlink() != args.status_path:
+            raise SystemExit(f"Unexpected OGN status link: {status_link}")
+    elif status_link.exists():
+        raise SystemExit(f"OGN status path already exists: {status_link}")
     for path, content in updates.items():
-        if content != path.read_text():
+        if not path.exists() or content != path.read_text():
             path.write_text(content)
             print(f"Patched {path}")
+    if not status_link.is_symlink():
+        status_link.symlink_to(args.status_path)
+        print(f"Linked {status_link} to {args.status_path}")
 
 
 if __name__ == "__main__":

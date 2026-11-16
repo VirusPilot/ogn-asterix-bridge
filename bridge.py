@@ -43,6 +43,8 @@ DATABASE_REFRESH = 86400
 DDB_MAX_BYTES = 8 * 1024 * 1024
 TAR1090_MAX_BYTES = 32 * 1024 * 1024
 TAR1090_UNCOMPRESSED_MAX = 128 * 1024 * 1024
+SOURCE_TTL = 75
+SOURCE_STATUS_INTERVAL = 3
 
 
 def parse_packet(line, now=None):
@@ -103,6 +105,46 @@ def parse_registration(line, now=None):
     if min(abs(now - (midnight + seconds + offset)) for offset in (-86400, 0, 86400)) > 120:
         return None
     return match["source"][-6:].upper(), match["registration"].upper()
+
+
+def direct_icao(line):
+    """Get an ICAO address from a validated readsb raw Mode S output line."""
+    line = line.strip()
+    if line.startswith(b"*"):
+        payload = line[1:-1]
+    elif line.startswith(b"@") and len(line) in (28, 42):
+        payload = line[13:-1]
+    else:
+        return None
+    if not line.endswith(b";") or len(payload) not in (14, 28):
+        return None
+    try:
+        message = bytes.fromhex(payload.decode("ascii"))
+    except (UnicodeError, ValueError):
+        return None
+    df = message[0] >> 3
+    if df in (11, 17, 18, 19):
+        address = int.from_bytes(message[1:4], "big")
+    elif df in (0, 4, 5, 16, 20, 21):
+        # Mode S address parity: the full-message CRC syndrome is the ICAO ID.
+        address = 0
+        for byte in message:
+            address ^= byte << 16
+            for _ in range(8):
+                address = ((address << 1) ^ (0xFFF409 if address & 0x800000 else 0)) & 0xFFFFFF
+    else:
+        return None
+    return f"{address:06X}" if address else None
+
+
+def source_status(ogn_seen, direct_seen, raw_ready, now):
+    """Keep only recently seen addresses in the tar1090 provenance snapshot."""
+    for seen in (ogn_seen, direct_seen):
+        for address, timestamp in list(seen.items()):
+            if now - timestamp > SOURCE_TTL:
+                del seen[address]
+    return {"now": now, "raw_ready": raw_ready,
+            "ogn": dict.fromkeys(ogn_seen, 1), "direct": dict.fromkeys(direct_seen, 1)}
 
 
 def atomic_write(path, content):
@@ -408,6 +450,10 @@ class Bridge:
     def __init__(self, args):
         self.args = args
         self.clients = set()
+        self.raw_clients = set()
+        self.ogn_seen = {}
+        self.direct_seen = {}
+        self.status_path = Path(args.status_path)
         self.registrations = RegistrationStore(args.registration_dir)
 
     def handle_registration(self, line):
@@ -421,6 +467,23 @@ class Bridge:
             await reader.read()  # keep socket until readsb disconnects
         finally:
             self.clients.discard(writer)
+            writer.close()
+            await writer.wait_closed()
+
+    async def raw_client(self, reader, writer):
+        """Track Mode S messages readsb received directly over its radio feed."""
+        self.raw_clients.add(writer)
+        try:
+            while line := await reader.readline():
+                if len(line) > 80:
+                    continue
+                address = direct_icao(line)
+                if address:
+                    self.direct_seen[address] = time.time()
+        except OSError:
+            pass
+        finally:
+            self.raw_clients.discard(writer)
             writer.close()
             await writer.wait_closed()
 
@@ -444,6 +507,7 @@ class Bridge:
                         continue
                     ddb_type = self.registrations.ddb_types.get(f"{report['addr']:06X}")
                     frame = cat21(report, ddb_type)
+                    self.ogn_seen[f"{report['addr']:06X}"] = time.time()
                     for client in tuple(self.clients):
                         try:
                             client.write(frame)
@@ -461,6 +525,13 @@ class Bridge:
                     except OSError:
                         pass
             await asyncio.sleep(10)
+
+    async def publish_source_status(self):
+        while True:
+            snapshot = source_status(self.ogn_seen, self.direct_seen,
+                                     bool(self.raw_clients), time.time())
+            atomic_write(self.status_path, (json.dumps(snapshot, separators=(",", ":")) + "\n").encode())
+            await asyncio.sleep(SOURCE_STATUS_INTERVAL)
 
     async def refresh_ddb(self):
         while True:
@@ -484,9 +555,12 @@ class Bridge:
 
     async def run(self):
         server = await asyncio.start_server(self.client, "127.0.0.1", self.args.asterix_port)
-        async with server:
+        raw_server = await asyncio.start_server(self.raw_client, "127.0.0.1", self.args.raw_port)
+        async with server, raw_server:
             LOG.info("ASTERIX listening on 127.0.0.1:%d", self.args.asterix_port)
-            await asyncio.gather(self.aprs(), self.refresh_ddb(), self.refresh_tar1090())
+            LOG.info("readsb raw output listening on 127.0.0.1:%d", self.args.raw_port)
+            await asyncio.gather(self.aprs(), self.refresh_ddb(), self.refresh_tar1090(),
+                                 self.publish_source_status())
 
 
 def main():
@@ -498,6 +572,8 @@ def main():
     parser.add_argument("--aprs-host", default="aprs.glidernet.org")
     parser.add_argument("--aprs-port", type=int, default=14580)
     parser.add_argument("--asterix-port", type=int, default=30991)
+    parser.add_argument("--raw-port", type=int, default=30992)
+    parser.add_argument("--status-path", default="/run/ogn-asterix-bridge/ogn-sources.json")
     parser.add_argument("--registration-dir", default="/var/lib/ogn-asterix-bridge")
     parser.add_argument("--ddb-url", default=DDB_URL)
     parser.add_argument("--tar1090-url", default=TAR1090_URL)
