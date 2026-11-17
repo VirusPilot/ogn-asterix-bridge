@@ -5,6 +5,57 @@ OGN receiver station. It converts OGN aircraft position reports to ASTERIX CAT02
 serves the stream on loopback TCP port 30991. The installed `readsb` connects
 to that port, so tar1090 displays the aircraft through its normal readsb feed.
 
+## Data flow
+
+```mermaid
+flowchart TD
+    subgraph sources[Data sources]
+        OGN["OGN receivers / rtlsdr-ogn"]
+        APRS["OGN APRS server<br/>aprs.glidernet.org:14580"]
+        RADIO["Local ADS-B / Mode S radio reception"]
+        DDB["OGN Devices Database<br/>Address types, registrations, models"]
+        TARDB["tar1090 aircraft database<br/>Registrations, ICAO types, descriptions, flags"]
+    end
+
+    subgraph bridge[OGN bridge]
+        FEED["Subscribe to APRS reports<br/>Configured receiver position and radius"]
+        PARSE["Validate aircraft positions<br/>Discard OGADSB and unusable / old reports"]
+        ENCODE["Encode ASTERIX CAT021<br/>ICAO for I addresses; non-ICAO otherwise<br/>WGS84 geometric altitude"]
+        REG["Cache APRS status Reg= values<br/>Expire after 30 days"]
+        MERGE["Merge cached aircraft databases<br/>Database identity takes precedence over APRS"]
+        DBFILE["aircraft.csv.gz"]
+        PROVENANCE["Track recent OGN and direct radio reports"]
+        STATUS["ogn-sources.json"]
+    end
+
+    OGN -->|Aircraft positions and status reports| APRS
+    APRS --> FEED
+    FEED --> PARSE
+    FEED -->|Status reports with Reg=| REG
+    DDB -->|Startup and daily refresh; cache on disk| MERGE
+    TARDB -->|Startup and daily refresh; cache on disk| MERGE
+    REG --> MERGE
+    MERGE --> DBFILE
+    DDB -->|Cached address type| ENCODE
+    PARSE --> ENCODE
+    PARSE -->|Recent OGN addresses| PROVENANCE
+
+    RADIO --> READSB["readsb<br/>Decode and merge matching ICAO tracks<br/>Direct ADS-B position has priority over ASTERIX"]
+    ENCODE -->|Loopback TCP 30991: asterix_in| READSB
+    DBFILE -->|Registration, type and model lookup| READSB
+    READSB -->|Raw Mode S output to loopback TCP 30992| PROVENANCE
+    PROVENANCE --> STATUS
+    READSB -->|Aircraft JSON: positions, altitudes and metadata| DISPLAY
+    STATUS -->|Polled by ogn_sources.js| DISPLAY
+    DISPLAY["Patched tar1090<br/>Map tracks, aircraft table and details<br/>OGN source label / filter / table color<br/>Separate barometric and geometric altitude fields"]
+```
+
+The raw Mode S path supplies source-label evidence only. For a shared ICAO
+address, readsb can combine OGN position and geometric altitude with directly
+received Mode S barometric altitude and squawk. Non-ICAO OGN targets stay
+separate, with a `~` address prefix. Tar1090 uses recent reception history to
+label shared ICAO tracks; its map markers retain the normal altitude colors.
+
 ## Prerequisites
 - running **rtlsdr-ogn** instance (e.g. based on https://github.com/VirusPilot/ogn-pi34)
 - running **readsb** instance (e.g. based on: https://github.com/wiedehopf/readsb)
