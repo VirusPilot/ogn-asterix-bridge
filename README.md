@@ -104,6 +104,26 @@ directly received ADS-B traffic. Receiver status and weather messages without
 an aircraft position and device ID cannot be encoded as CAT021 aircraft tracks.
 The readsb connector reconnects automatically after either service restarts.
 
+## OGN to ASTERIX mapping
+
+The bridge encodes the following OGN APRS traffic elements in the CAT021
+subset consumed by readsb:
+
+| Received OGN traffic element | ASTERIX CAT021 field | Conversion or handling |
+| --- | --- | --- |
+| Latitude from the APRS position | I021/130 — Position in WGS-84 Coordinates | Degrees converted to the ASTERIX 24-bit angular representation. |
+| Longitude from the APRS position | I021/130 — Position in WGS-84 Coordinates | Degrees converted to the ASTERIX 24-bit angular representation. |
+| Six-digit device ID from `idXXxxxxxx`, or from the OGN source callsign | I021/080 — Target Address | Sent as the six-digit address. It is encoded as an ICAO address only when the OGN Devices Database identifies it as type `I`; otherwise it remains a non-ICAO address. |
+| OGN address type (`I` versus other or unknown) | I021/040 — Target Report Descriptor | Selects the ICAO or non-ICAO address descriptor. |
+| `/A=xxxxxx` altitude | I021/140 — Geometric Height | WGS-84 geometric altitude in feet, converted to ASTERIX 6.25-foot units. |
+| APRS course (`ccc`) and speed (`sss`) | I021/160 — Airborne Ground Vector | Course in degrees becomes track angle; speed in km/h is converted to ASTERIX ground-speed units. The field is included only when both values are present. |
+| APRS timestamp (`hhmmssh`) | — | Used to reject stale or invalid reports; it is not encoded in CAT021. |
+| APRS tocall | — | `OGADSB` reports are discarded. Other accepted OGN tocalls are not encoded as a separate CAT021 field. |
+| `Reg=` status value | — | Stored for aircraft-database registration lookup; it is not encoded in the CAT021 aircraft report. |
+
+Every encoded report also includes I021/010 — Data Source Identification, with
+the bridge's fixed SAC/SIC value `0/1`.
+
 ## Altitude display
 
 OGN `/A=` is WGS84 geometric altitude. The bridge sends it only as ASTERIX
